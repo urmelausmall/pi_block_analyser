@@ -102,6 +102,127 @@ def safe_int(x: Optional[str]) -> Optional[int]:
     except Exception:
         return None
 
+import urllib.request
+
+COUNTRY_CODES_URL = os.getenv(
+    "COUNTRY_CODES_URL",
+    "https://www.xrepository.de/api/xrepository/urn:xoev-de:kosit:codeliste:country-codes_8/download/Country_Codes_8.json",
+).strip()
+COUNTRY_CODES_CACHE = os.getenv("COUNTRY_CODES_CACHE", os.path.join(STATE_DIR, "Country_Codes_8.json")).strip()
+
+# Wird beim Startup gefüllt:
+ISO2_META: Dict[str, Dict[str, str]] = {}  # {"DE": {"country":"DE","country_name":"Deutschland","flag":"🇩🇪"}, ...}
+
+
+def _download_country_codes_sync(url: str, dest: str) -> bool:
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with urllib.request.urlopen(url, timeout=20) as r:
+            data = r.read()
+        with open(dest, "wb") as f:
+            f.write(data)
+        return True
+    except Exception:
+        return False
+
+
+def iso2_to_flag(iso2: str) -> str:
+    # ISO2 -> Regional Indicator Symbols (🇩🇪 etc.)
+    if not iso2 or len(iso2) != 2:
+        return ""
+    iso2 = iso2.upper()
+    if not ("A" <= iso2[0] <= "Z" and "A" <= iso2[1] <= "Z"):
+        return ""
+    return chr(0x1F1E6 + (ord(iso2[0]) - ord("A"))) + chr(0x1F1E6 + (ord(iso2[1]) - ord("A")))
+
+
+def _load_country_codes_sync(path: str) -> Dict[str, Dict[str, str]]:
+    """
+    Liest XRepository Country_Codes_8.json:
+      - spalten: enthält Index-Infos
+      - daten: rows als arrays
+    Wir bauen ISO2 -> ShortName (DE) + Flag.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+
+        cols = j.get("spalten") or []
+        col_index = {}
+        for idx, c in enumerate(cols):
+            # "spaltennameTechnisch": "ISOAlpha2code", "ShortName", ...
+            key = (c.get("spaltennameTechnisch") or "").strip()
+            if key:
+                col_index[key] = idx
+
+        i_iso2 = col_index.get("ISOAlpha2code")
+        i_short = col_index.get("ShortName")
+        i_full = col_index.get("FullName")
+
+        if i_iso2 is None:
+            return {}
+
+        out: Dict[str, Dict[str, str]] = {}
+        for row in (j.get("daten") or []):
+            try:
+                iso2 = (row[i_iso2] or "").strip().upper()
+                if not iso2 or len(iso2) != 2:
+                    continue
+                name = None
+                if i_short is not None:
+                    name = row[i_short]
+                if not name and i_full is not None:
+                    name = row[i_full]
+                name = (name or iso2).strip()
+
+                out[iso2] = {
+                    "country": iso2,
+                    "country_name": name,
+                    "flag": iso2_to_flag(iso2),
+                }
+            except Exception:
+                continue
+
+        return out
+    except Exception:
+        return {}
+
+
+async def load_country_codes():
+    global ISO2_META
+
+    # 1) Cache lesen
+    if os.path.exists(COUNTRY_CODES_CACHE):
+        ISO2_META = await asyncio.to_thread(_load_country_codes_sync, COUNTRY_CODES_CACHE)
+        if ISO2_META:
+            return
+
+    # 2) Download versuchen
+    ok = await asyncio.to_thread(_download_country_codes_sync, COUNTRY_CODES_URL, COUNTRY_CODES_CACHE)
+    if ok:
+        ISO2_META = await asyncio.to_thread(_load_country_codes_sync, COUNTRY_CODES_CACHE)
+
+    # 3) Notfall: wenigstens DE/US etc. nicht komplett leer
+    if not ISO2_META:
+        ISO2_META = {
+            "DE": {"country": "DE", "country_name": "Deutschland", "flag": "🇩🇪"},
+            "US": {"country": "US", "country_name": "Vereinigte Staaten", "flag": "🇺🇸"},
+            "NL": {"country": "NL", "country_name": "Niederlande", "flag": "🇳🇱"},
+            "FR": {"country": "FR", "country_name": "Frankreich", "flag": "🇫🇷"},
+            "GB": {"country": "GB", "country_name": "Vereinigtes Königreich", "flag": "🇬🇧"},
+        }
+
+
+def country_meta(iso2: str) -> dict:
+    iso2 = (iso2 or "").upper()
+    if iso2 in ISO2_META:
+        return ISO2_META[iso2]
+    # Fallback (?? etc.)
+    return {
+        "country": iso2,
+        "country_name": iso2 if iso2 else "??",
+        "flag": iso2_to_flag(iso2),
+    }
 
 # ============================================================
 # Regexes
@@ -564,6 +685,7 @@ latest_lines = deque(maxlen=MAX_LATEST_LINES)
 @app.on_event("startup")
 async def on_startup():
     await state_store.load()
+    await load_country_codes()
     await db.connect()
 
     for p in [LOG_GEO, LOG_NTOP, LOG_STREAM]:
@@ -822,7 +944,11 @@ async def geo_top_countries(hours: int = 24, limit: int = 50):
         """,
         (hours,),
     )
-    return {"window_hours": hours, "items": [{"country": r["country"], "count": int(r["c"])} for r in (rows or [])]}
+    items = []
+    for r in (rows or []):
+        meta = country_meta(r["country"])
+        items.append({**meta, "count": int(r["c"])})
+    return {"window_hours": hours, "items": items}
 
 
 # ============================================================
@@ -975,8 +1101,19 @@ async def ntop_top_countries(hours: int = 24, limit: int = 15):
         """,
         (hours,),
     )
-    return {"window_hours": hours, "items": [{"country": r["country"], "count": int(r["c"])} for r in (rows or [])]}
 
+    items = []
+    for r in (rows or []):
+        cc = (r["country"] or "??")
+        meta = country_meta(cc) if cc != "??" else {"country":"??","country_name":"Unbekannt","flag":""}
+        items.append({**meta, "count": int(r["c"])})
+    return {"window_hours": hours, "items": items}
+
+@app.get("/meta/countries")
+async def meta_countries():
+    # Sortiert nach Code
+    items = [ISO2_META[k] for k in sorted(ISO2_META.keys())]
+    return {"count": len(items), "items": items}
 
 @app.get("/ntop/trend/hourly")
 async def ntop_trend_hourly(hours: int = 24):
@@ -1053,6 +1190,28 @@ async def ui():
   .table th,.table td{border-bottom:1px solid #1f2a44;padding:8px 6px;text-align:left;font-size:13px}
   .tight td{padding:6px 6px}
   .right{text-align:right}
+  .legend{ margin-top:10px; }
+.legend ul{
+  list-style:none; padding:0; margin:0;
+  display:flex; flex-wrap:wrap; gap:8px 10px;
+  justify-content:center;
+}
+.legend li{
+  display:flex; align-items:center; gap:8px;
+  padding:4px 8px;
+  border:1px solid #2a3a5a;
+  border-radius:999px;
+  color: var(--txt);
+  cursor:pointer;
+  user-select:none;
+  font-size:12px;
+}
+.legend li:hover{ border-color:#3d5a93; }
+.legend .box{
+  width:10px; height:10px; border-radius:3px;
+  border:1px solid rgba(255,255,255,0.25);
+}
+.legend .muted{ color: var(--muted); }
 </style>
 </head>
 <body>
@@ -1099,6 +1258,7 @@ async def ui():
     <div class="kpi" style="margin-top:6px"><div class="v" id="geoCountries">-</div><div class="l">Länder</div></div>
     <div class="muted" style="margin-top:10px">Pie je nach Modus.</div>
     <canvas id="geoPie" style="margin-top:10px"></canvas>
+    <div id="geoLegend" class="legend"></div>
   </div>
 
   <!-- NTOP KPI + PIE -->
@@ -1117,6 +1277,7 @@ async def ui():
     <div class="kpi" style="margin-top:6px"><div class="v" id="ntopUniq">-</div><div class="l">Unique IPs</div></div>
     <div class="muted" style="margin-top:10px">Pie je nach Modus.</div>
     <canvas id="ntopPie" style="margin-top:10px"></canvas>
+    <div id="ntopLegend" class="legend"></div>
   </div>
 
   <!-- NTOP Top IPs -->
@@ -1234,6 +1395,103 @@ let ntopPie=null;
 let geoTrend=null;
 let ntopTrend=null;
 
+let COUNTRY = {}; // ISO2 -> {country,country_name,flag}
+
+const htmlLegendPlugin = {
+  id: 'htmlLegend',
+  afterUpdate(chart, args, opts) {
+    const container = document.getElementById(opts.containerID);
+    if (!container) return;
+
+    container.innerHTML = '';
+    const ul = document.createElement('ul');
+
+    const labels = chart.data.labels || [];
+    const meta = chart.getDatasetMeta(0);
+    const ctrl = meta?.controller;
+
+    labels.forEach((raw, i) => {
+      const li = document.createElement('li');
+
+      const visible = chart.getDataVisibility(i);
+      li.style.opacity = visible ? '1' : '0.45';
+
+      // Farbe pro Slice zuverlässig holen
+      let bg = '#3b82f6'; // fallback
+      try {
+        const style = ctrl?.getStyle(i);
+        if (style?.backgroundColor) bg = style.backgroundColor;
+      } catch(_) {}
+
+      const box = document.createElement('span');
+      box.className = 'box';
+      box.style.backgroundColor = bg;
+
+      let text = String(raw ?? '');
+      let title = text;
+
+      if (opts.decorateCountries && typeof raw === 'string' && raw.length === 2) {
+        const lab = countryLabel(raw);
+        text = lab.text || raw;     // "🇩🇪 DE"
+        title = lab.title || raw;   // "Deutschland (DE)"
+      }
+
+      const label = document.createElement('span');
+      label.textContent = text;
+      li.title = title;
+
+      // Click = ein/ausblenden
+      li.onclick = () => {
+        chart.toggleDataVisibility(i);
+        chart.update();
+      };
+
+      // Mouseover = Tooltip + Highlight (nice!)
+      li.onmouseenter = () => {
+        chart.setActiveElements([{ datasetIndex: 0, index: i }]);
+        chart.tooltip?.update();
+        chart.draw();
+      };
+      li.onmouseleave = () => {
+        chart.setActiveElements([]);
+        chart.tooltip?.update();
+        chart.draw();
+      };
+
+      li.appendChild(box);
+      li.appendChild(label);
+      ul.appendChild(li);
+    });
+
+    container.appendChild(ul);
+  }
+};
+
+async function loadCountryMeta(){
+  try{
+    const r = await fetch('/meta/countries');
+    const j = await r.json();
+    const map = {};
+    (j.items || []).forEach(it => { map[it.country] = it; });
+    COUNTRY = map;
+  }catch(e){
+    COUNTRY = {};
+  }
+}
+
+function countryLabel(code){
+  code = (code || '').toUpperCase();
+  if(code === '??' || !code) return { code:'??', text: '??', title: 'Unbekannt', flag: '' };
+
+  const it = COUNTRY[code];
+  if(!it) return { code, text: code, title: code, flag: '' };
+
+  const flag = it.flag || '';
+  const title = `${it.country_name} (${it.country})`;
+  const text = `${flag ? flag+' ' : ''}${it.country}`;   // <- FLAG + ISO2
+  return { code: it.country, text, title, flag };
+}
+
 const logEl=document.getElementById('log');
 const pauseBtn=document.getElementById('pauseBtn');
 const connEl=document.getElementById('conn');
@@ -1306,14 +1564,54 @@ function connect(){
   };
 }
 
-function makePie(canvasId, labels, values){
-  const ctx = document.getElementById(canvasId);
-  return new Chart(ctx, {
+function makePie(canvasId, labels, values, decorateCountries=false){
+  const el = document.getElementById(canvasId);
+  if(!el) return null;
+
+  const legendContainerID = (canvasId === 'geoPie') ? 'geoLegend' : 'ntopLegend';
+
+  return new Chart(el, {
     type: 'pie',
     data: { labels, datasets: [{ data: values }] },
-    options: { plugins: { legend: { position:'bottom', labels:{ color:'#d6deeb' } } } }
+    plugins: [htmlLegendPlugin],
+    options: {
+      plugins: {
+        // Canvas-Legend AUS (die hat dir "undefined" reingeschossen)
+        legend: { display: false },
+
+        // Unsere HTML-Legend
+        htmlLegend: {
+          containerID: legendContainerID,
+          decorateCountries: decorateCountries
+        },
+
+        // Tooltips bleiben (für Pie hover)
+        tooltip: {
+          callbacks: {
+            title: (items) => {
+              const raw = items?.[0]?.label ?? '';
+              if(decorateCountries && typeof raw === 'string' && raw.length === 2){
+                return countryLabel(raw).title || raw;
+              }
+              return String(raw ?? '');
+            },
+            label: (ctx) => {
+              const raw = ctx.label ?? '';
+              const v = ctx.parsed ?? 0;
+
+              if(decorateCountries && typeof raw === 'string' && raw.length === 2){
+                const lab = countryLabel(raw);
+                return `${lab.text || raw}: ${v}`;
+              }
+              return `${String(raw)}: ${v}`;
+            }
+          }
+        }
+      }
+    }
   });
 }
+
 
 function makeLine(canvasId, labels, values){
   const ctx = document.getElementById(canvasId);
@@ -1355,13 +1653,17 @@ async function loadGeo(){
   document.getElementById('geoUniq').textContent  = j.unique_ips ?? '-';
   document.getElementById('geoCountries').textContent  = j.countries ?? '-';
 
+  const mode = geoMode();
+  const decorate = (mode === 'countries');
+
   let chartUrl = `/geo/chart/countries?hours=${h}&limit=10`;
-  if(geoMode() === 'ips') chartUrl = `/geo/chart/ips?hours=${h}&limit=10`;
+  if(mode === 'ips') chartUrl = `/geo/chart/ips?hours=${h}&limit=10`;
 
   const c = await fetch(chartUrl);
   const cj = await c.json();
+
   if(geoPie) geoPie.destroy();
-  geoPie = makePie('geoPie', cj.labels || [], cj.values || []);
+  geoPie = makePie('geoPie', cj.labels || [], cj.values || [], decorate);
 }
 
 async function loadNtop(){
@@ -1373,14 +1675,18 @@ async function loadNtop(){
   document.getElementById('ntopTotal').textContent = j.total_events ?? '-';
   document.getElementById('ntopUniq').textContent  = j.unique_ips ?? '-';
 
+  const mode = ntopMode();
+  const decorate = (mode === 'countries');
+
   let chartUrl = `/ntop/chart/actions?hours=${h}`;
-  if(ntopMode() === 'countries') chartUrl = `/ntop/chart/countries?hours=${h}&limit=10`;
-  if(ntopMode() === 'ips') chartUrl = `/ntop/chart/ips?hours=${h}&limit=10`;
+  if(mode === 'countries') chartUrl = `/ntop/chart/countries?hours=${h}&limit=10`;
+  if(mode === 'ips')       chartUrl = `/ntop/chart/ips?hours=${h}&limit=10`;
 
   const c = await fetch(chartUrl);
   const cj = await c.json();
+
   if(ntopPie) ntopPie.destroy();
-  ntopPie = makePie('ntopPie', cj.labels || [], cj.values || []);
+  ntopPie = makePie('ntopPie', cj.labels || [], cj.values || [], decorate);
 }
 
 async function loadGeoTopUrls(){
@@ -1434,7 +1740,12 @@ async function loadNtopTopCountries(){
   tb.innerHTML = items.length ? '' : '<tr><td class="muted" colspan="2">keine Daten</td></tr>';
   items.forEach(it=>{
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td class="mono">${escapeHtml(it.country || '??')}</td><td class="right">${it.count || 0}</td>`;
+    const cc = it.country || '??';
+    const lab = countryLabel(cc);
+    tr.innerHTML = `
+    <td class="mono"><span title="${escapeHtml(lab.title)}">${escapeHtml(lab.text)}</span></td>
+    <td class="right">${it.count || 0}</td>
+    `;
     tb.appendChild(tr);
   });
 }
@@ -1474,7 +1785,9 @@ async function loadGeoCountriesDropdown(){
   items.forEach(it=>{
     const opt = document.createElement('option');
     opt.value = it.country;
-    opt.textContent = `${it.country} (${it.count})`;
+    const lab = countryLabel(it.country);
+    opt.textContent = `${lab.flag ? lab.flag+' ' : ''}${it.country} (${it.count})`;
+    opt.title = lab.title;
     sel.appendChild(opt);
   });
 
@@ -1514,12 +1827,20 @@ async function reloadAll(){
 }
 
 // initial load
-reloadAll();
-loadLatest();
-connect();
+async function init(){
+  try{
+    await loadCountryMeta();
+    await reloadAll();
+    await loadLatest();
+    connect();
+    setInterval(()=>{ reloadAll(); }, 60_000);
+  }catch(e){
+    console.error("init failed", e);
+    connEl.textContent = "init failed";
+  }
+}
 
-// periodic refresh for stats (not logs)
-setInterval(()=>{ reloadAll(); }, 60_000);
+init();
 </script>
 </body>
 </html>"""
