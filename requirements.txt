@@ -1,0 +1,5 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pymysql==1.1.1
+python-dateutil==2.9.0.post0
+geoip2==4.8.1
