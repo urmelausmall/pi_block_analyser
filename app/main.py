@@ -854,18 +854,38 @@ async def geo_top_ips(hours: int = 24, limit: int = 15):
     hours = clamp_hours(hours)
     limit = clamp_limit(limit, 1, 200)
 
+    # pro IP das häufigste Land im Zeitraum bestimmen + Gesamtcount
     rows = await db.fetchall(
         f"""
-        SELECT ip, COUNT(*) AS c
-        FROM geo_blocks
-        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR)
-        GROUP BY ip
-        ORDER BY c DESC
-        LIMIT {limit}
+        SELECT x.ip, x.total AS c, x.country
+        FROM (
+          SELECT t.ip,
+                 SUM(t.c) AS total,
+                 SUBSTRING_INDEX(
+                   GROUP_CONCAT(t.country ORDER BY t.c DESC SEPARATOR ','),
+                   ',', 1
+                 ) AS country
+          FROM (
+            SELECT ip, country, COUNT(*) AS c
+            FROM geo_blocks
+            WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR)
+            GROUP BY ip, country
+          ) t
+          GROUP BY t.ip
+          ORDER BY total DESC
+          LIMIT {limit}
+        ) x
         """,
         (hours,),
     )
-    items = [{"ip": ip_bytes_to_str(r["ip"]), "count": int(r["c"])} for r in (rows or [])]
+
+    items = []
+    for r in (rows or []):
+        ip_str = ip_bytes_to_str(r["ip"])
+        cc = (r.get("country") or "??").upper()
+        meta = country_meta(cc) if cc != "??" else {"country": "??", "country_name": "Unbekannt", "flag": ""}
+        items.append({"ip": ip_str, "count": int(r["c"]), **meta})
+
     return {"window_hours": hours, "items": items}
 
 
@@ -1066,21 +1086,39 @@ async def ntop_top_ips(hours: int = 24, limit: int = 15):
 
     rows = await db.fetchall(
         f"""
-        SELECT ip, COUNT(*) AS c
-        FROM ntop_blacklist_events
-        WHERE ts_local >= (NOW() - INTERVAL %s HOUR)
-          AND ip IS NOT NULL
-          AND action IN ('blocked','already_blocked')
-        GROUP BY ip
-        ORDER BY c DESC
-        LIMIT {limit}
+        SELECT x.ip, x.total AS c, x.country
+        FROM (
+          SELECT t.ip,
+                 SUM(t.c) AS total,
+                 SUBSTRING_INDEX(
+                   GROUP_CONCAT(t.country ORDER BY t.c DESC SEPARATOR ','),
+                   ',', 1
+                 ) AS country
+          FROM (
+            SELECT ip,
+                   COALESCE(country,'??') AS country,
+                   COUNT(*) AS c
+            FROM ntop_blacklist_events
+            WHERE ts_local >= (NOW() - INTERVAL %s HOUR)
+              AND ip IS NOT NULL
+              AND action IN ('blocked','already_blocked')
+            GROUP BY ip, COALESCE(country,'??')
+          ) t
+          GROUP BY t.ip
+          ORDER BY total DESC
+          LIMIT {limit}
+        ) x
         """,
         (hours,),
     )
+
     items = []
     for r in (rows or []):
-        ipb = r.get("ip")
-        items.append({"ip": ip_bytes_to_str(ipb) if ipb else None, "count": int(r.get("c", 0))})
+        ip_str = ip_bytes_to_str(r["ip"]) if r.get("ip") else None
+        cc = (r.get("country") or "??").upper()
+        meta = country_meta(cc) if cc != "??" else {"country": "??", "country_name": "Unbekannt", "flag": ""}
+        items.append({"ip": ip_str, "count": int(r["c"]), **meta})
+
     return {"window_hours": hours, "items": items}
 
 
@@ -1712,7 +1750,18 @@ async function loadGeoTopIps(){
   tb.innerHTML = items.length ? '' : '<tr><td class="muted" colspan="2">keine Daten</td></tr>';
   items.forEach(it=>{
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td class="mono">${escapeHtml(it.ip || '-')}</td><td class="right">${it.count || 0}</td>`;
+    const cc = (it.country || '??').toUpperCase();
+const lab = countryLabel(cc);
+const name = it.country_name || (lab.title || 'Unbekannt');
+
+tr.innerHTML = `
+  <td class="mono">
+    <span title="${escapeHtml(name)}">${escapeHtml(lab.text || cc)}</span>
+    &nbsp; ${escapeHtml(it.ip || '-')}
+    <span class="muted">(${escapeHtml(name)})</span>
+  </td>
+  <td class="right">${it.count || 0}</td>
+`;
     tb.appendChild(tr);
   });
 }
@@ -1726,7 +1775,18 @@ async function loadNtopTopIps(){
   tb.innerHTML = items.length ? '' : '<tr><td class="muted" colspan="2">keine Daten</td></tr>';
   items.forEach(it=>{
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td class="mono">${escapeHtml(it.ip || '-')}</td><td class="right">${it.count || 0}</td>`;
+    const cc = (it.country || '??').toUpperCase();
+const lab = countryLabel(cc);
+const name = it.country_name || (lab.title || 'Unbekannt');
+
+tr.innerHTML = `
+  <td class="mono">
+    <span title="${escapeHtml(name)}">${escapeHtml(lab.text || cc)}</span>
+    &nbsp; ${escapeHtml(it.ip || '-')}
+    <span class="muted">(${escapeHtml(name)})</span>
+  </td>
+  <td class="right">${it.count || 0}</td>
+`;
     tb.appendChild(tr);
   });
 }
