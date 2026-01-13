@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 import json
 import os
@@ -8,11 +9,25 @@ from datetime import datetime, timezone
 from ipaddress import ip_address, IPv4Address, IPv6Address
 from typing import Dict, Optional, List
 
+import hashlib
+import traceback
+import urllib.request
+import urllib.error
+from datetime import timedelta
 import pymysql
 from dateutil import parser as dtparser
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, PlainTextResponse
+
+from fastapi.staticfiles import StaticFiles
+
+STATIC_DIR = os.getenv("STATIC_DIR", "/data/static")
+
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+else:
+    print(f"[static] skip mount, dir missing: {STATIC_DIR}", flush=True)
 
 # Optional GeoIP (für NTOP -> Land)
 try:
@@ -49,10 +64,73 @@ MAX_LATEST_LINES = int(os.getenv("MAX_LATEST_LINES", "800"))
 
 GEOIP_MMDB = os.getenv("GEOIP_MMDB", "").strip()
 
+CROWDSEC_LAPI_URL = os.getenv("CROWDSEC_LAPI_URL", "").strip()
+
+# Watcher Login (Machine)
+CROWDSEC_MACHINE_ID = os.getenv("CROWDSEC_MACHINE_ID", "").strip()
+CROWDSEC_MACHINE_PASSWORD = os.getenv("CROWDSEC_MACHINE_PASSWORD", "").strip()
+
+CROWDSEC_POLL_EVERY_SEC = int(os.getenv("CROWDSEC_POLL_EVERY_SEC", "60"))
+CROWDSEC_FETCH_LIMIT = int(os.getenv("CROWDSEC_FETCH_LIMIT", "200"))
 
 # ============================================================
 # Helpers
 # ============================================================
+
+
+
+def stable_bigint_id(*parts: str) -> int:
+    s = "|".join([p for p in parts if p])
+    h = hashlib.sha256(s.encode("utf-8", "ignore")).digest()
+    return int.from_bytes(h[:8], "big", signed=False)  # 0..2^64-1
+
+def pick_alert_ip(a: dict) -> tuple[Optional[str], Optional[str]]:
+    """
+    Return (scope, value) where scope like 'Ip' and value is IP string.
+    Try common CrowdSec alert shapes.
+    """
+    # 1) explicit source
+    src = a.get("source") or {}
+    scope = src.get("scope") or a.get("scope")
+    value = src.get("value") or a.get("value")
+    if scope and value and str(scope).lower() == "ip":
+        return "Ip", str(value)
+
+    # 2) meta
+    meta = meta_dict(a.get("meta")) or {}
+    for k in ("source_ip", "ip", "value"):
+        v = meta.get(k)
+        if v:
+            return "Ip", str(v)
+
+    # 3) events meta
+    events = a.get("events") or []
+    if isinstance(events, list) and events:
+        em = (events[0].get("meta") or {}) if isinstance(events[0], dict) else {}
+        for k in ("source_ip", "src_ip", "ip", "value", "log_ip"):
+            v = em.get(k)
+            if v:
+                return "Ip", str(v)
+
+    return (None, None)
+
+
+def _http_get_json_sync(url: str, headers: dict, timeout: int = 15) -> dict:
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read()
+    return json.loads(data.decode("utf-8", errors="replace"))
+
+def _http_post_json_sync(url: str, headers: dict, payload: dict, timeout: int = 15) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    h = dict(headers or {})
+    h.setdefault("Content-Type", "application/json")
+    h.setdefault("Accept", "application/json")
+    req = urllib.request.Request(url, headers=h, data=data, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+    return json.loads(raw.decode("utf-8", errors="replace"))
+
 def now_utc_naive() -> datetime:
     return datetime.utcnow().replace(tzinfo=None)
 
@@ -102,7 +180,7 @@ def safe_int(x: Optional[str]) -> Optional[int]:
     except Exception:
         return None
 
-import urllib.request
+
 
 COUNTRY_CODES_URL = os.getenv(
     "COUNTRY_CODES_URL",
@@ -187,6 +265,8 @@ def _load_country_codes_sync(path: str) -> Dict[str, Dict[str, str]]:
     except Exception:
         return {}
 
+def as_dict(x):
+    return x if isinstance(x, dict) else {}
 
 async def load_country_codes():
     global ISO2_META
@@ -223,6 +303,305 @@ def country_meta(iso2: str) -> dict:
         "country_name": iso2 if iso2 else "??",
         "flag": iso2_to_flag(iso2),
     }
+
+def _parse_iso_to_utc_naive(s: str) -> datetime:
+    # CrowdSec liefert meist Zulu-Zeit (…Z)
+    try:
+        dt = dtparser.isoparse(s)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=None)
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return now_utc_naive()
+
+# ============================================================
+# CrowdSec Auth (Watcher JWT cache)
+# ============================================================
+_cs_token: Optional[str] = None
+_cs_token_exp: Optional[datetime] = None
+_cs_token_lock = asyncio.Lock()
+
+def _token_valid() -> bool:
+    global _cs_token, _cs_token_exp
+    if not _cs_token or not _cs_token_exp:
+        return False
+    # 30s Puffer
+    return now_utc_naive() < (_cs_token_exp - timedelta(seconds=30))
+
+async def crowdsec_get_token(force: bool = False) -> Optional[str]:
+    global _cs_token, _cs_token_exp
+
+    if not CROWDSEC_LAPI_URL or not CROWDSEC_MACHINE_ID or not CROWDSEC_MACHINE_PASSWORD:
+        return None
+
+    async with _cs_token_lock:
+        if not force and _token_valid():
+            return _cs_token
+
+        base = CROWDSEC_LAPI_URL.rstrip("/")
+        url = f"{base}/v1/watchers/login"
+
+        payload = {"machine_id": CROWDSEC_MACHINE_ID, "password": CROWDSEC_MACHINE_PASSWORD}
+        try:
+            j = await asyncio.to_thread(_http_post_json_sync, url, {}, payload, 15)
+        except Exception:
+            _cs_token = None
+            _cs_token_exp = None
+            return None
+
+        token = j.get("token") or j.get("access_token") or j.get("jwt")
+        if not token:
+            _cs_token = None
+            _cs_token_exp = None
+            return None
+
+        _cs_token = str(token)
+        exp = j.get("expire")
+        _cs_token_exp = _parse_iso_to_utc_naive(exp) if exp else now_utc_naive() + timedelta(minutes=10)
+        return _cs_token
+
+async def crowdsec_headers(force_refresh: bool = False) -> Optional[dict]:
+    tok = await crowdsec_get_token(force=force_refresh)
+    if not tok:
+        return None
+    return {"Authorization": f"Bearer {tok}", "Accept": "application/json"}
+
+def meta_dict(x):
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, list) and x:
+        for it in x:
+            if isinstance(it, dict):
+                return it
+    return {}
+
+def _as_list(x):
+    if isinstance(x, list):
+        return x
+    if isinstance(x, dict):
+        return x.get("items") or x.get("alerts") or x.get("decisions") or x.get("data") or []
+    return []
+
+
+async def crowdsec_poll_once(db: DB):
+    if not CROWDSEC_LAPI_URL or not CROWDSEC_MACHINE_ID or not CROWDSEC_MACHINE_PASSWORD:
+        return
+
+    base = CROWDSEC_LAPI_URL.rstrip("/")
+
+    async def fetch_with_auth(path: str):
+        # 1) normal
+        h = await crowdsec_headers(force_refresh=False)
+        if not h:
+            return []
+        url = f"{base}{path}"
+        try:
+            return await asyncio.to_thread(_http_get_json_sync, url, h, 15)
+        except urllib.error.HTTPError as e:
+            # 401 → Token neu holen und 1x retry
+            if getattr(e, "code", None) == 401:
+                h2 = await crowdsec_headers(force_refresh=True)
+                if not h2:
+                    return []
+                try:
+                    return await asyncio.to_thread(_http_get_json_sync, url, h2, 15)
+                except Exception:
+                    return []
+            return []
+        except Exception:
+            return []
+
+    alerts = await fetch_with_auth(f"/v1/alerts?limit={CROWDSEC_FETCH_LIMIT}")
+    decisions = await fetch_with_auth(f"/v1/decisions?limit={CROWDSEC_FETCH_LIMIT}")
+
+    alerts_list = _as_list(alerts)
+    decisions_list = _as_list(decisions)
+    alerts_list = [a for a in _as_list(alerts) if isinstance(a, dict)]
+    decisions_list = [d for d in _as_list(decisions) if isinstance(d, dict)]
+
+     # --- ALERTS upsert ---
+    for a in alerts_list:
+        try:
+            # ---- ID robust ----            
+            raw_id = a.get("id") or a.get("uuid") or (as_dict(a.get("meta")) or {}).get("uuid")
+            if isinstance(raw_id, int):
+                alert_id = raw_id
+            elif isinstance(raw_id, str) and raw_id.strip():
+                alert_id = stable_bigint_id(raw_id.strip())
+            else:
+                created_s = str(a.get("created_at") or a.get("createdAt") or "")
+                first_dec = ""
+                try:
+                    first_dec = str((a.get("decisions") or [{}])[0].get("id") or "")
+                except Exception:
+                    pass
+                alert_id = stable_bigint_id(
+                    created_s + "|" + first_dec + "|" + json.dumps(a, sort_keys=True, ensure_ascii=False)
+                )
+
+            created = a.get("created_at") or a.get("createdAt") or a.get("created_at_utc")
+            ts_utc = _parse_iso_to_utc_naive(created) if created else now_utc_naive()
+
+            scope, value = pick_alert_ip(a)
+            ipb = None
+            if scope == "Ip" and value:
+                try:
+                    ipb = ip_address(value).packed
+                except Exception:
+                    ipb = None
+
+            scenario = a.get("scenario") or a.get("scenario_name") or a.get("scenario_name_slug")
+            # 🔥 Filter: CAPI / Blocklist Updates ignorieren
+            if scenario:
+                s = scenario.lower()
+                if s == "update" or s.startswith("update"):
+                    continue
+            reason = a.get("message") or a.get("reason") or scenario
+
+            meta = meta_dict(a.get("meta"))
+
+            country = (a.get("country") or meta.get("country") or "").upper()[:2] or None
+            # Fallback: GeoIP anhand IP, wenn CrowdSec kein Country liefert
+            if not country and value:
+                try:
+                    country = geoip_country_code(value)
+                except Exception:
+                    country = None
+
+            as_name = a.get("as") or a.get("asn") or meta.get("asn") or None
+
+            dc = 0
+            try:
+                dc = len(a.get("decisions") or [])
+            except Exception:
+                dc = 0
+
+            raw = json.dumps(a, ensure_ascii=False)
+
+            await db.exec(
+                """
+                INSERT INTO crowdsec_alerts
+                  (id, ts_utc, ip, scope, value, reason, scenario, country, as_name, decisions_count, raw_json)
+                VALUES
+                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                  ts_utc=VALUES(ts_utc),
+                  ip=VALUES(ip),
+                  scope=VALUES(scope),
+                  value=VALUES(value),
+                  reason=VALUES(reason),
+                  scenario=VALUES(scenario),
+                  country=VALUES(country),
+                  as_name=VALUES(as_name),
+                  decisions_count=VALUES(decisions_count),
+                  raw_json=VALUES(raw_json)
+                """,
+                (
+                    alert_id,
+                    ts_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                    ipb,
+                    scope,
+                    value,
+                    reason[:255] if reason else None,
+                    scenario[:255] if scenario else None,
+                    country,
+                    as_name[:255] if isinstance(as_name, str) else None,
+                    dc,
+                    raw,
+                ),
+            )
+        except Exception:
+            print("[crowdsec] alert upsert failed:\n" + traceback.format_exc(), flush=True)
+
+    # --- DECISIONS upsert ---
+    for d in decisions_list:
+        try:
+            decision_id = int(d.get("id"))
+        except Exception:
+            continue
+
+        try:
+            created = d.get("created_at") or d.get("createdAt") or d.get("start_at")
+            ts_utc = _parse_iso_to_utc_naive(created) if created else now_utc_naive()
+
+            scope_val = d.get("scope") or ""
+            value = d.get("value") or ""
+            action = d.get("type") or d.get("action") or "ban"
+            reason = d.get("reason") or d.get("scenario") or None
+            scenario = d.get("scenario") or None
+
+            country = (d.get("country") or "").upper()[:2] or None
+             # Fallback: GeoIP wenn Decision eine IP ist
+            if not country and scope_val.lower() == "ip" and value:
+                try:
+                    country = geoip_country_code(value)
+                except Exception:
+                    country = None
+
+            as_name = d.get("as") or d.get("asn") or None
+
+            events = d.get("events")
+            alert_id = d.get("alert_id") or d.get("alertId")
+
+            duration = d.get("duration")  # "4h", "39m", "1h2m3s"
+            duration_sec = None
+            if isinstance(duration, str):
+                m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", duration.strip())
+                if m:
+                    hh = int(m.group(1) or 0)
+                    mm = int(m.group(2) or 0)
+                    ss = int(m.group(3) or 0)
+                    duration_sec = hh * 3600 + mm * 60 + ss
+            elif isinstance(duration, (int, float)):
+                duration_sec = int(duration)
+
+            expires = d.get("until") or d.get("expires_at") or d.get("expiration")
+            expires_at = _parse_iso_to_utc_naive(expires) if isinstance(expires, str) else None
+
+            raw = json.dumps(d, ensure_ascii=False)
+
+            await db.exec(
+                """
+                INSERT INTO crowdsec_decisions
+                  (id, ts_utc, scope, value, action, reason, scenario, country, as_name, events, alert_id, duration_sec, expires_at_utc, raw_json)
+                VALUES
+                  (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON DUPLICATE KEY UPDATE
+                  ts_utc=VALUES(ts_utc),
+                  scope=VALUES(scope),
+                  value=VALUES(value),
+                  action=VALUES(action),
+                  reason=VALUES(reason),
+                  scenario=VALUES(scenario),
+                  country=VALUES(country),
+                  as_name=VALUES(as_name),
+                  events=VALUES(events),
+                  alert_id=VALUES(alert_id),
+                  duration_sec=VALUES(duration_sec),
+                  expires_at_utc=VALUES(expires_at_utc),
+                  raw_json=VALUES(raw_json)
+                """,
+                (
+                    decision_id,
+                    ts_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                    scope_val,
+                    value,
+                    action,
+                    (reason or "")[:255] if reason else None,
+                    (scenario or "")[:255] if scenario else None,
+                    country,
+                    as_name[:255] if as_name else None,
+                    int(events) if isinstance(events, (int, float, str)) and str(events).isdigit() else None,
+                    int(alert_id) if isinstance(alert_id, (int, float, str)) and str(alert_id).isdigit() else None,
+                    duration_sec,
+                    expires_at.strftime("%Y-%m-%d %H:%M:%S") if expires_at else None,
+                    raw,
+                ),
+            )
+        except Exception:
+            print("[crowdsec] decision upsert failed:\n" + traceback.format_exc(), flush=True)
+
+
 
 # ============================================================
 # Regexes
@@ -391,8 +770,7 @@ class DB:
             self._schema_ready = True
 
     async def _ensure_schema(self):
-        await asyncio.to_thread(
-            self._run_sync,
+        stmts = [
             """
             CREATE TABLE IF NOT EXISTS geo_blocks (
               id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -406,11 +784,54 @@ class DB:
               KEY idx_country_ts (country, ts_utc),
               KEY idx_ip_ts (ip, ts_utc),
               KEY idx_url_ts (url(191), ts_utc)
-            );
+            )
             """,
-            None,
-            "none",
-        )
+            """
+            CREATE TABLE IF NOT EXISTS crowdsec_alerts (
+              id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+              ts_utc DATETIME NOT NULL,
+              ip VARBINARY(16) NULL,
+              scope VARCHAR(32) NULL,
+              value VARCHAR(128) NULL,
+              reason VARCHAR(255) NULL,
+              scenario VARCHAR(255) NULL,
+              country CHAR(2) NULL,
+              as_name VARCHAR(255) NULL,
+              decisions_count INT NOT NULL DEFAULT 0,
+              raw_json JSON NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              KEY idx_ts (ts_utc),
+              KEY idx_ip_ts (ip, ts_utc),
+              KEY idx_scenario_ts (scenario, ts_utc)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS crowdsec_decisions (
+              id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+              ts_utc DATETIME NOT NULL,
+              scope VARCHAR(32) NOT NULL,
+              value VARCHAR(128) NOT NULL,
+              action VARCHAR(32) NOT NULL,
+              reason VARCHAR(255) NULL,
+              scenario VARCHAR(255) NULL,
+              country CHAR(2) NULL,
+              as_name VARCHAR(255) NULL,
+              events INT NULL,
+              alert_id BIGINT UNSIGNED NULL,
+              duration_sec INT NULL,
+              expires_at_utc DATETIME NULL,
+              raw_json JSON NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              KEY idx_ts (ts_utc),
+              KEY idx_scope_value (scope, value),
+              KEY idx_alert (alert_id),
+              KEY idx_expires (expires_at_utc)
+            )
+            """,
+        ]
+
+        for s in stmts:
+            await asyncio.to_thread(self._run_sync, s, None, "none")
 
         await asyncio.to_thread(
             self._run_sync,
@@ -700,6 +1121,18 @@ async def on_startup():
             await asyncio.sleep(RETENTION_RUN_EVERY_SEC)
 
     asyncio.create_task(retention_loop())
+    asyncio.create_task(crowdsec_loop())
+
+
+async def crowdsec_loop():
+    while True:
+        try:
+            await crowdsec_poll_once(db)
+        except Exception:
+            print("[crowdsec] poll loop crashed:\n" + traceback.format_exc(), flush=True)
+        await asyncio.sleep(max(10, CROWDSEC_POLL_EVERY_SEC))
+
+
 
 
 # ============================================================
@@ -816,7 +1249,7 @@ async def geo_chart_ips(hours: int = 24, limit: int = 10):
 
     rows = await db.fetchall(
         f"""
-        SELECT ip, COUNT(*) AS c
+        SELECT ip, country, COUNT(*) AS c
         FROM geo_blocks
         WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR)
         GROUP BY ip
@@ -825,8 +1258,17 @@ async def geo_chart_ips(hours: int = 24, limit: int = 10):
         """,
         (hours,),
     )
-    labels = [ip_bytes_to_str(r["ip"]) for r in (rows or [])]
-    values = [int(r["c"]) for r in (rows or [])]
+    labels = []
+    values = []
+
+    for r in (rows or []):
+        ip_str = ip_bytes_to_str(r["ip"])
+        cc = (r.get("country") or "??").upper()
+        meta = country_meta(cc) if cc != "??" else {"flag": "", "country": "??"}
+
+        label = f"{meta.get('flag','')} {meta.get('country')} {ip_str}".strip()
+        labels.append(label)
+        values.append(int(r["c"]))
     return {"labels": labels, "values": values, "window_hours": hours}
 
 
@@ -1063,7 +1505,7 @@ async def ntop_chart_ips(hours: int = 24, limit: int = 10):
 
     rows = await db.fetchall(
         f"""
-        SELECT ip, COUNT(*) AS c
+        SELECT ip, country, COUNT(*) AS c
         FROM ntop_blacklist_events
         WHERE ts_local >= (NOW() - INTERVAL %s HOUR)
           AND ip IS NOT NULL
@@ -1074,8 +1516,17 @@ async def ntop_chart_ips(hours: int = 24, limit: int = 10):
         """,
         (hours,),
     )
-    labels = [ip_bytes_to_str(r["ip"]) for r in (rows or [])]
-    values = [int(r["c"]) for r in (rows or [])]
+    labels = []
+    values = []
+
+    for r in (rows or []):
+        ip_str = ip_bytes_to_str(r["ip"])
+        cc = (r.get("country") or "??").upper()
+        meta = country_meta(cc) if cc != "??" else {"flag": "", "country": "??"}
+
+        label = f"{meta.get('flag','')} {meta.get('country')} {ip_str}".strip()
+        labels.append(label)
+        values.append(int(r["c"]))
     return {"labels": labels, "values": values, "window_hours": hours}
 
 
@@ -1181,6 +1632,259 @@ async def ntop_trend_hourly(hours: int = 24):
     }
 
 
+# ============================================================
+# CROWDSEC APIs (stats + charts + tops)
+# ============================================================
+
+@app.get("/crowdsec/stats")
+async def crowdsec_stats(hours: int = 24):
+    hours = clamp_hours(hours)
+
+    # Alerts im Zeitraum
+    total = await db.fetchone(
+        "SELECT COUNT(*) AS c FROM crowdsec_alerts WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR)",
+        (hours,),
+    )
+    uniq_alert_ips = await db.fetchone(
+        """
+        SELECT COUNT(DISTINCT ip) AS c
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR) AND ip IS NOT NULL
+        """,
+        (hours,),
+    )
+    scenarios = await db.fetchone(
+        """
+        SELECT COUNT(DISTINCT scenario) AS c
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR) AND scenario IS NOT NULL AND scenario <> ''
+        """,
+        (hours,),
+    )
+    with_dec = await db.fetchone(
+        """
+        SELECT COUNT(*) AS c
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR) AND decisions_count > 0
+        """,
+        (hours,),
+    )
+    no_dec = await db.fetchone(
+        """
+        SELECT COUNT(*) AS c
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR) AND (decisions_count = 0 OR decisions_count IS NULL)
+        """,
+        (hours,),
+    )
+
+    # Decisions aktiv + im Zeitraum
+    active = await db.fetchone(
+        """
+        SELECT COUNT(*) AS c
+        FROM crowdsec_decisions
+        WHERE (expires_at_utc IS NULL OR expires_at_utc > UTC_TIMESTAMP())
+        """,
+        None,
+    )
+    uniq_dec_ips = await db.fetchone(
+        """
+        SELECT COUNT(DISTINCT value) AS c
+        FROM crowdsec_decisions
+        WHERE (expires_at_utc IS NULL OR expires_at_utc > UTC_TIMESTAMP())
+          AND scope='Ip' AND value IS NOT NULL AND value <> ''
+        """,
+        None,
+    )
+
+    return {
+        "window_hours": hours,
+        "alerts_total": int(total["c"]) if total else 0,
+        "alerts_unique_ips": int(uniq_alert_ips["c"]) if uniq_alert_ips else 0,
+        "alerts_scenarios": int(scenarios["c"]) if scenarios else 0,
+        "alerts_with_decision": int(with_dec["c"]) if with_dec else 0,
+        "alerts_no_decision": int(no_dec["c"]) if no_dec else 0,
+        "decisions_active": int(active["c"]) if active else 0,
+        "decisions_active_unique_ips": int(uniq_dec_ips["c"]) if uniq_dec_ips else 0,
+    }
+
+
+@app.get("/crowdsec/chart/scenarios")
+async def crowdsec_chart_scenarios(hours: int = 24, limit: int = 10):
+    hours = clamp_hours(hours)
+    limit = clamp_limit(limit, 3, 50)
+
+    rows = await db.fetchall(
+        f"""
+        SELECT COALESCE(NULLIF(scenario,''),'(unknown)') AS scenario, COUNT(*) AS c
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR)
+        GROUP BY COALESCE(NULLIF(scenario,''),'(unknown)')
+        ORDER BY c DESC
+        LIMIT {limit}
+        """,
+        (hours,),
+    )
+    return {
+        "window_hours": hours,
+        "labels": [r["scenario"] for r in (rows or [])],
+        "values": [int(r["c"]) for r in (rows or [])],
+    }
+
+
+@app.get("/crowdsec/chart/countries")
+async def crowdsec_chart_countries(hours: int = 24, limit: int = 10):
+    hours = clamp_hours(hours)
+    limit = clamp_limit(limit, 3, 50)
+
+    rows = await db.fetchall(
+        f"""
+        SELECT COALESCE(country,'??') AS country, COUNT(*) AS c
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR)
+        GROUP BY COALESCE(country,'??')
+        ORDER BY c DESC
+        LIMIT {limit}
+        """,
+        (hours,),
+    )
+    return {
+        "window_hours": hours,
+        "labels": [r["country"] for r in (rows or [])],
+        "values": [int(r["c"]) for r in (rows or [])],
+    }
+
+
+@app.get("/crowdsec/chart/ips")
+async def crowdsec_chart_ips(hours: int = 24, limit: int = 10):
+    hours = clamp_hours(hours)
+    limit = clamp_limit(limit, 3, 20)
+
+    rows = await db.fetchall(
+        f"""
+        SELECT ip, country, COUNT(*) AS c
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR) AND ip IS NOT NULL
+        GROUP BY ip
+        ORDER BY c DESC
+        LIMIT {limit}
+        """,
+        (hours,),
+    )
+    labels = []
+    values = []
+
+    for r in (rows or []):
+        ip_str = ip_bytes_to_str(r["ip"])
+        cc = (r.get("country") or "??").upper()
+        meta = country_meta(cc) if cc != "??" else {"flag": "", "country": "??"}
+
+        label = f"{meta.get('flag','')} {meta.get('country')} {ip_str}".strip()
+        labels.append(label)
+        values.append(int(r["c"]))
+    return {"window_hours": hours, "labels": labels, "values": values}
+
+
+@app.get("/crowdsec/top/scenarios")
+async def crowdsec_top_scenarios(hours: int = 24, limit: int = 15):
+    hours = clamp_hours(hours)
+    limit = clamp_limit(limit, 1, 200)
+
+    rows = await db.fetchall(
+        f"""
+        SELECT COALESCE(NULLIF(scenario,''),'(unknown)') AS scenario, COUNT(*) AS c
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR)
+        GROUP BY COALESCE(NULLIF(scenario,''),'(unknown)')
+        ORDER BY c DESC
+        LIMIT {limit}
+        """,
+        (hours,),
+    )
+    return {"window_hours": hours, "items": [{"scenario": r["scenario"], "count": int(r["c"])} for r in (rows or [])]}
+
+
+@app.get("/crowdsec/top/countries")
+async def crowdsec_top_countries(hours: int = 24, limit: int = 15):
+    hours = clamp_hours(hours)
+    limit = clamp_limit(limit, 1, 200)
+
+    rows = await db.fetchall(
+        f"""
+        SELECT COALESCE(country,'??') AS country, COUNT(*) AS c
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR)
+        GROUP BY COALESCE(country,'??')
+        ORDER BY c DESC
+        LIMIT {limit}
+        """,
+        (hours,),
+    )
+    items = []
+    for r in (rows or []):
+        cc = (r["country"] or "??").upper()
+        meta = country_meta(cc) if cc != "??" else {"country":"??","country_name":"Unbekannt","flag":""}
+        items.append({**meta, "count": int(r["c"])})
+    return {"window_hours": hours, "items": items}
+
+@app.get("/crowdsec/top/ips")
+async def crowdsec_top_ips(hours: int = 24, limit: int = 15):
+    hours = clamp_hours(hours)
+    limit = clamp_limit(limit, 1, 200)
+
+    rows = await db.fetchall(
+        f"""
+        SELECT ip, COUNT(*) AS c,
+               COALESCE(NULLIF(country,''),'??') AS country
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR)
+          AND ip IS NOT NULL
+        GROUP BY ip, COALESCE(NULLIF(country,''),'??')
+        ORDER BY c DESC
+        LIMIT {limit}
+        """,
+        (hours,),
+    )
+
+    items = []
+    for r in (rows or []):
+        ip_str = ip_bytes_to_str(r["ip"])
+        cc = (r.get("country") or "??").upper()
+        meta = country_meta(cc) if cc != "??" else {"country":"??","country_name":"Unbekannt","flag":""}
+        items.append({"ip": ip_str, "count": int(r["c"]), **meta})
+
+    return {"window_hours": hours, "items": items}
+
+@app.get("/crowdsec/alerts/latest")
+async def crowdsec_alerts_latest(limit: int = 50):
+    limit = clamp_limit(limit, 1, 200)
+
+    rows = await db.fetchall(
+        f"""
+        SELECT ts_utc, scenario, value, decisions_count,
+               COALESCE(NULLIF(country,''),'??') AS country,
+               COALESCE(as_name,'') AS as_name
+        FROM crowdsec_alerts
+        ORDER BY ts_utc DESC
+        LIMIT {limit}
+        """,
+        None,
+    )
+
+    items = []
+    for r in (rows or []):
+        cc = (r.get("country") or "??").upper()
+        meta = country_meta(cc) if cc != "??" else {"country":"??","country_name":"Unbekannt","flag":""}
+        items.append({
+            "ts_utc": r["ts_utc"].strftime("%Y-%m-%d %H:%M:%S") if r.get("ts_utc") else "",
+            "scenario": r.get("scenario") or "(unknown)",
+            "value": r.get("value") or "",
+            "decisions_count": int(r.get("decisions_count") or 0),
+            "as_name": r.get("as_name") or "",
+            **meta,
+        })
+
+    return {"items": items}
 
 # ============================================================
 # Web UI
@@ -1194,11 +1898,32 @@ async def ui():
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Geo Log Hub</title>
 <style>
+@font-face{
+  font-family: 'NotoColorEmojiWeb';
+  src: url('/static/fonts/NotoColorEmoji.ttf') format('truetype');
+  font-weight: normal;
+  font-style: normal;
+}
+body,
+.mono,
+table,
+th,
+td,
+select,
+option {
+  font-family:
+    'NotoColorEmojiWeb',
+    'Segoe UI Emoji',
+    'Apple Color Emoji',
+    'Noto Color Emoji',
+    system-ui,
+    sans-serif;
+}
   :root{
     --bg:#0b0f14; --card:#0f172a; --card2:#111827; --line:#233047;
     --txt:#d6deeb; --muted:#93a4bd; --acc:#93c5fd;
   }
-  body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif}
+  body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,Segoe UI,Segoe UI Emoji,Noto Color Emoji,Roboto,Arial,sans-serif}
   header{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px 16px;background:var(--card2);border-bottom:1px solid var(--line)}
   header b{letter-spacing:.2px}
   main{padding:12px 16px}
@@ -1250,6 +1975,27 @@ async def ui():
   border:1px solid rgba(255,255,255,0.25);
 }
 .legend .muted{ color: var(--muted); }
+.bar{
+  display:flex;
+  height:18px;
+  width:100%;
+  background:#0b1220;
+  border:1px solid #2a3a5a;
+  border-radius:999px;
+  overflow:hidden;
+}
+.bar-geo{
+  background:#3b82f6; /* blau */
+  height:100%;
+}
+.bar-ntop{
+  background:#f59e0b; /* orange */
+  height:100%;
+}
+.bar-cs{
+  background:#ef4444; /* rot */
+  height:100%;
+}
 </style>
 </head>
 <body>
@@ -1304,8 +2050,8 @@ async def ui():
     <div class="row" style="justify-content:space-between">
       <b>NTOP</b>
       <select id="ntopMode" onchange="loadNtop()">
-        <option value="actions" selected>Actions</option>
-        <option value="countries">Länder</option>
+        <option value="actions">Actions</option>
+        <option value="countries" selected>Länder</option>
         <option value="ips">IPs</option>
       </select>
     </div>
@@ -1318,17 +2064,34 @@ async def ui():
     <div id="ntopLegend" class="legend"></div>
   </div>
 
-  <!-- NTOP Top IPs -->
-  <div class="card span4">
-    <div class="row" style="justify-content:space-between">
-      <b>NTOP Top IPs</b>
-      <button onclick="loadNtopTopIps()">Reload</button>
-    </div>
-    <table class="table tight" style="margin-top:8px">
-      <thead><tr><th>IP</th><th class="right">Count</th></tr></thead>
-      <tbody id="ntopTopIps"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
-    </table>
+  
+<div class="card span4">
+  <div class="row" style="justify-content:space-between">
+    <b>CROWDSEC</b>
+    <select id="csMode" onchange="loadCrowdsec()">
+      <option value="scenarios" selected>Scenarios</option>
+      <option value="countries">Länder</option>
+      <option value="ips">IPs</option>
+    </select>
   </div>
+
+    <div class="kpi" style="margin-top:8px">
+    <div class="v" id="csAlerts">-</div><div class="l" id="csAlertsSub">Alerts</div>
+  </div>
+
+  <div class="kpi" style="margin-top:6px">
+    <div class="v" id="csDecisions">-</div><div class="l">aktive Decisions</div>
+  </div>
+
+  <div class="kpi" style="margin-top:6px">
+    <div class="v" id="csUniqIps">-</div><div class="l">Unique IPs (Alerts)</div>
+  </div>
+
+  <div class="muted" style="margin-top:10px">Pie je nach Modus.</div>
+  <canvas id="csPie" style="margin-top:10px"></canvas>
+  <div id="csLegend" class="legend"></div>
+</div>
+
 
   <!-- Trends -->
   <div class="card span6">
@@ -1347,17 +2110,32 @@ async def ui():
     <canvas id="ntopTrend" style="margin-top:10px"></canvas>
   </div>
 
-  <!-- GEO Top URLs -->
+
+  <!-- GEO Top Countries -->
+<div class="card span6">
+  <div class="row" style="justify-content:space-between">
+    <b>GEO Top Länder</b>
+    <button onclick="loadGeoTopCountries()">Reload</button>
+  </div>
+  <table class="table tight" style="margin-top:8px">
+    <thead><tr><th>Land</th><th class="right">Count</th></tr></thead>
+    <tbody id="geoTopCountries"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
+  </table>
+</div>
+
+  <!-- NTOP Top Countries -->
   <div class="card span6">
     <div class="row" style="justify-content:space-between">
-      <b>GEO Top URLs</b>
-      <button onclick="loadGeoTopUrls()">Reload</button>
+      <b>NTOP Top Länder</b>
+      <button onclick="loadNtopTopCountries()">Reload</button>
     </div>
     <table class="table tight" style="margin-top:8px">
-      <thead><tr><th>URL</th><th class="right">Count</th></tr></thead>
-      <tbody id="geoTopUrls"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
+      <thead><tr><th>Land</th><th class="right">Count</th></tr></thead>
+      <tbody id="ntopTopCountries"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
     </table>
   </div>
+
+
 
   <!-- GEO Top IPs -->
   <div class="card span6">
@@ -1371,18 +2149,80 @@ async def ui():
     </table>
   </div>
 
-  <!-- NTOP Top Countries -->
+  <!-- NTOP Top IPs -->
   <div class="card span6">
     <div class="row" style="justify-content:space-between">
-      <b>NTOP Top Länder</b>
-      <button onclick="loadNtopTopCountries()">Reload</button>
+      <b>NTOP Top IPs</b>
+      <button onclick="loadNtopTopIps()">Reload</button>
     </div>
-    <div class="muted" style="margin-top:6px">Kommt aus GeoIP (wenn GEOIP_MMDB gesetzt). Sonst meist "??".</div>
     <table class="table tight" style="margin-top:8px">
-      <thead><tr><th>Land</th><th class="right">Count</th></tr></thead>
-      <tbody id="ntopTopCountries"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
+      <thead><tr><th>IP</th><th class="right">Count</th></tr></thead>
+      <tbody id="ntopTopIps"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
     </table>
   </div>
+
+<!-- CROWDSEC Top IPs -->
+<div class="card span6">
+  <div class="row" style="justify-content:space-between">
+    <b>CROWDSEC Top IPs</b>
+    <button onclick="loadCsTopIps()">Reload</button>
+  </div>
+  <table class="table tight" style="margin-top:8px">
+    <thead><tr><th>IP</th><th class="right">Count</th></tr></thead>
+    <tbody id="csTopIps"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
+  </table>
+</div>
+
+<!-- CROWDSEC Top Länder -->
+<div class="card span6">
+  <div class="row" style="justify-content:space-between">
+    <b>CROWDSEC Top Länder</b>
+    <button onclick="loadCsTopCountries()">Reload</button>
+  </div>
+  <table class="table tight" style="margin-top:8px">
+    <thead><tr><th>Land</th><th class="right">Count</th></tr></thead>
+    <tbody id="csTopCountries"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
+  </table>
+</div>
+
+<!-- CROWDSEC Letzte Alerts -->
+<div class="card span6">
+  <div class="row" style="justify-content:space-between">
+    <b>CROWDSEC Letzte Alerts</b>
+    <button onclick="loadCsLatestAlerts()">Reload</button>
+  </div>
+  <table class="table tight" style="margin-top:8px">
+    <thead><tr><th>Zeit</th><th>Scenario</th><th>IP</th><th class="right">Dec</th></tr></thead>
+    <tbody id="csLatestAlerts"><tr><td class="muted" colspan="4">loading…</td></tr></tbody>
+  </table>
+</div>
+
+<!-- CROWDSEC Top Scenarios -->
+<div class="card span6">
+  <div class="row" style="justify-content:space-between">
+    <b>CROWDSEC Top Scenarios</b>
+    <button onclick="loadCsTopScenarios()">Reload</button>
+  </div>
+  <table class="table tight" style="margin-top:8px">
+    <thead><tr><th>Scenario</th><th class="right">Count</th></tr></thead>
+    <tbody id="csTopScenarios"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
+  </table>
+</div>
+
+
+
+  <!-- GEO Top URLs -->
+  <div class="card span6">
+    <div class="row" style="justify-content:space-between">
+      <b>GEO Top URLs</b>
+      <button onclick="loadGeoTopUrls()">Reload</button>
+    </div>
+    <table class="table tight" style="margin-top:8px">
+      <thead><tr><th>URL</th><th class="right">Count</th></tr></thead>
+      <tbody id="geoTopUrls"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
+    </table>
+  </div>
+
 
   <!-- GEO Top URL by Country -->
   <div class="card span6">
@@ -1393,13 +2233,13 @@ async def ui():
       </div>
       <button onclick="loadGeoTopUrlsByCountry()">Reload</button>
     </div>
-    <div class="muted" style="margin-top:6px">Land-Auswahl kommt aus den Top Ländern im Zeitraum.</div>
     <table class="table tight" style="margin-top:8px">
       <thead><tr><th>URL</th><th class="right">Count</th></tr></thead>
       <tbody id="geoTopUrlsByCountry"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
     </table>
   </div>
 
+  
   <!-- Logs -->
   <div class="card span12">
     <div class="row" style="justify-content:space-between">
@@ -1432,6 +2272,8 @@ let geoPie=null;
 let ntopPie=null;
 let geoTrend=null;
 let ntopTrend=null;
+let sumPie = null;
+let csPie=null;
 
 let COUNTRY = {}; // ISO2 -> {country,country_name,flag}
 
@@ -1517,6 +2359,108 @@ async function loadCountryMeta(){
   }
 }
 
+async function loadSummary(){
+  const h = getHours();
+
+  const [geoR, ntopR] = await Promise.all([
+    fetch(`/geo/stats?hours=${h}`),
+    fetch(`/ntop/stats?hours=${h}`)
+  ]);
+
+  const geo = await geoR.json();
+  const ntop = await ntopR.json();
+
+  const geoBlocks  = geo.unique_ips || 0;
+  const ntopBlocks = ntop.new_blocks || 0;   
+  const ntopEvents = ntop.total_events || 0;
+
+  // KPIs
+  document.getElementById('sumGeoBlocks').textContent  = geoBlocks;
+  document.getElementById('sumNtopBlocks').textContent = ntopBlocks;
+  document.getElementById('sumNtopEvents').textContent = ntopEvents;
+
+  document.getElementById('sumGeoUniq').textContent  = geo.unique_ips ?? '-';
+  document.getElementById('sumNtopUniq').textContent = ntop.unique_ips ?? '-';
+
+  // Summary Pie (2 Slices)
+  const labels = ['GEO Blocks', 'NTOP New-Blocks'];
+  const values = [geoBlocks, ntopBlocks];
+
+  if(sumPie) sumPie.destroy();
+  sumPie = makePie('sumPie', labels, values, false);
+}
+
+async function loadGeoTopCountries(){
+  const h = getHours();
+  const r = await fetch(`/geo/top/countries?hours=${h}&limit=15`);
+  const j = await r.json();
+  const tb = document.getElementById('geoTopCountries');
+  const items = j.items || [];
+  tb.innerHTML = items.length ? '' : '<tr><td class="muted" colspan="2">keine Daten</td></tr>';
+
+  items.forEach(it=>{
+    const tr = document.createElement('tr');
+    const cc = it.country || '??';
+    const lab = countryLabel(cc);
+    const name = it.country_name || lab.title || 'Unbekannt';
+
+    tr.innerHTML = `
+      <td class="mono">
+        <span title="${escapeHtml(name)}">${escapeHtml(lab.text)}</span>
+      </td>
+      <td class="right">${it.count || 0}</td>
+    `;
+    tb.appendChild(tr);
+  });
+}
+
+async function loadCsTopIps(){
+  const h = getHours();
+  const r = await fetch(`/crowdsec/top/ips?hours=${h}&limit=15`);
+  const j = await r.json();
+  const tb = document.getElementById('csTopIps');
+  const items = j.items || [];
+  tb.innerHTML = items.length ? '' : '<tr><td class="muted" colspan="2">keine Daten</td></tr>';
+
+  items.forEach(it=>{
+    const tr = document.createElement('tr');
+    const cc = (it.country || '??').toUpperCase();
+    const lab = countryLabel(cc);
+    const name = it.country_name || (lab.title || 'Unbekannt');
+    tr.innerHTML = `
+      <td class="mono">
+        <span title="${escapeHtml(name)}">${escapeHtml(lab.text || cc)}</span>
+        &nbsp; ${escapeHtml(it.ip || '-')}
+      </td>
+      <td class="right">${it.count || 0}</td>
+    `;
+    tb.appendChild(tr);
+  });
+}
+
+async function loadCsLatestAlerts(){
+  const r = await fetch(`/crowdsec/alerts/latest?limit=40`);
+  const j = await r.json();
+  const tb = document.getElementById('csLatestAlerts');
+  const items = j.items || [];
+  tb.innerHTML = items.length ? '' : '<tr><td class="muted" colspan="4">keine Daten</td></tr>';
+
+  items.forEach(it=>{
+    const cc = (it.country || '??').toUpperCase();
+    const lab = countryLabel(cc);
+    const name = it.country_name || (lab.title || 'Unbekannt');
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="mono">${escapeHtml(it.ts_utc || '')}</td>
+      <td class="mono" title="${escapeHtml(it.as_name || '')}">${escapeHtml(it.scenario || '')}</td>
+      <td class="mono"><span title="${escapeHtml(name)}">${escapeHtml(lab.text || cc)}</span> ${escapeHtml(it.value || '')}</td>
+      <td class="right">${it.decisions_count ?? 0}</td>
+    `;
+    tb.appendChild(tr);
+  });
+}
+
 function countryLabel(code){
   code = (code || '').toUpperCase();
   if(code === '??' || !code) return { code:'??', text: '??', title: 'Unbekannt', flag: '' };
@@ -1543,7 +2487,9 @@ function geoMode(){
 function ntopMode(){
   return document.getElementById('ntopMode').value || 'actions';
 }
-
+function csMode(){
+  return document.getElementById('csMode').value || 'scenarios';
+}
 function wantSource(){
   return document.getElementById('source').value;
 }
@@ -1606,7 +2552,11 @@ function makePie(canvasId, labels, values, decorateCountries=false){
   const el = document.getElementById(canvasId);
   if(!el) return null;
 
-  const legendContainerID = (canvasId === 'geoPie') ? 'geoLegend' : 'ntopLegend';
+    const legendContainerID =
+    (canvasId === 'geoPie')  ? 'geoLegend'  :
+    (canvasId === 'ntopPie') ? 'ntopLegend' :
+    (canvasId === 'csPie')   ? 'csLegend'   :
+                              'sumLegend';
 
   return new Chart(el, {
     type: 'pie',
@@ -1727,6 +2677,33 @@ async function loadNtop(){
   ntopPie = makePie('ntopPie', cj.labels || [], cj.values || [], decorate);
 }
 
+async function loadCrowdsec(){
+  const h = getHours();
+
+  const r = await fetch(`/crowdsec/stats?hours=${h}`);
+  const j = await r.json();
+
+ document.getElementById('csAlerts').textContent = j.alerts_total ?? '-';
+  const noDec = j.alerts_no_decision ?? 0;
+  document.getElementById('csAlertsSub').textContent = `Alerts (${noDec} ohne Decision)`;
+
+  document.getElementById('csDecisions').textContent = j.decisions_active ?? '-';
+  document.getElementById('csUniqIps').textContent   = j.alerts_unique_ips ?? '-';
+
+  const mode = csMode();
+  const decorate = (mode === 'countries');
+
+  let chartUrl = `/crowdsec/chart/scenarios?hours=${h}&limit=10`;
+  if(mode === 'countries') chartUrl = `/crowdsec/chart/countries?hours=${h}&limit=10`;
+  if(mode === 'ips')       chartUrl = `/crowdsec/chart/ips?hours=${h}&limit=10`;
+
+  const c = await fetch(chartUrl);
+  const cj = await c.json();
+
+  if(csPie) csPie.destroy();
+  csPie = makePie('csPie', cj.labels || [], cj.values || [], decorate);
+}
+
 async function loadGeoTopUrls(){
   const h = getHours();
   const r = await fetch(`/geo/top/urls?hours=${h}&limit=15`);
@@ -1762,6 +2739,41 @@ tr.innerHTML = `
   </td>
   <td class="right">${it.count || 0}</td>
 `;
+    tb.appendChild(tr);
+  });
+}
+
+async function loadCsTopScenarios(){
+  const h = getHours();
+  const r = await fetch(`/crowdsec/top/scenarios?hours=${h}&limit=15`);
+  const j = await r.json();
+  const tb = document.getElementById('csTopScenarios');
+  const items = j.items || [];
+  tb.innerHTML = items.length ? '' : '<tr><td class="muted" colspan="2">keine Daten</td></tr>';
+
+  items.forEach(it=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td class="mono">${escapeHtml(it.scenario || '(unknown)')}</td><td class="right">${it.count || 0}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+async function loadCsTopCountries(){
+  const h = getHours();
+  const r = await fetch(`/crowdsec/top/countries?hours=${h}&limit=15`);
+  const j = await r.json();
+  const tb = document.getElementById('csTopCountries');
+  const items = j.items || [];
+  tb.innerHTML = items.length ? '' : '<tr><td class="muted" colspan="2">keine Daten</td></tr>';
+
+  items.forEach(it=>{
+    const tr = document.createElement('tr');
+    const cc = it.country || '??';
+    const lab = countryLabel(cc);
+    tr.innerHTML = `
+      <td class="mono"><span title="${escapeHtml(lab.title)}">${escapeHtml(lab.text)}</span></td>
+      <td class="right">${it.count || 0}</td>
+    `;
     tb.appendChild(tr);
   });
 }
@@ -1875,12 +2887,18 @@ async function reloadAll(){
   await Promise.allSettled([
     loadGeo(),
     loadNtop(),
+    loadCrowdsec(),
     loadGeoTopUrls(),
     loadGeoTopIps(),
     loadNtopTopIps(),
+    loadGeoTopCountries(),
     loadNtopTopCountries(),
     loadGeoTrend(),
     loadNtopTrend(),
+    loadCsTopScenarios(),
+    loadCsTopCountries(),
+    loadCsTopIps(),
+    loadCsLatestAlerts(),
     loadGeoCountriesDropdown(),
   ]);
   await loadGeoTopUrlsByCountry();
