@@ -22,6 +22,8 @@ from fastapi.responses import StreamingResponse, PlainTextResponse
 
 from fastapi.staticfiles import StaticFiles
 
+app = FastAPI(title="Geo Log Hub", version="1.4.0")
+
 STATIC_DIR = os.getenv("STATIC_DIR", "/data/static")
 
 if os.path.isdir(STATIC_DIR):
@@ -97,7 +99,7 @@ def pick_alert_ip(a: dict) -> tuple[Optional[str], Optional[str]]:
         return "Ip", str(value)
 
     # 2) meta
-    meta = meta_dict(a.get("meta")) or {}
+    meta = kv_meta_to_dict(a.get("meta")) or {}
     for k in ("source_ip", "ip", "value"):
         v = meta.get(k)
         if v:
@@ -314,6 +316,94 @@ def _parse_iso_to_utc_naive(s: str) -> datetime:
     except Exception:
         return now_utc_naive()
 
+def pick_alert_target(a: dict) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    returns (target, host, method, msg) – best-effort
+    target: URI/Pfad
+    host:   target_fqdn / http_host
+    method: GET/POST/...
+    msg:    CrowdSec 'msg' (z.B. "Detect access to .env files")
+    """
+    # meta auf alert-level
+    am = kv_meta_to_dict(a.get("meta"))
+
+    # msg ist oft im alert-meta
+    msg = _maybe_json_first(am.get("msg")) or am.get("message")
+
+    # method ist oft im alert-meta
+    method = _maybe_json_first(am.get("method")) or am.get("http_verb")
+
+    # target_uri ist oft im alert-meta
+    target = _maybe_json_first(am.get("target_uri")) or _maybe_json_first(am.get("uri"))
+
+    # events meta: dort ist target_fqdn + uri oft sauber drin
+    events = a.get("events") or []
+    if isinstance(events, list):
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            em = kv_meta_to_dict(ev.get("meta"))
+
+            host = em.get("target_fqdn") or em.get("http_host") or em.get("host")
+            ev_uri = em.get("uri") or em.get("target_uri") or em.get("request_uri") or em.get("path")
+
+            ev_msg = em.get("message")  # bei dir: "Detect access to .env files"
+            if not msg and ev_msg:
+                msg = ev_msg
+
+            if not method:
+                method = em.get("method") or em.get("http_verb")
+
+            # wenn wir im event ein uri haben, bevorzugen
+            if ev_uri:
+                target = ev_uri
+
+            if host or target or method or msg:
+                # normalize
+                if isinstance(target, str):
+                    target = target.strip()[:512]
+                else:
+                    target = None
+                if isinstance(host, str):
+                    host = host.strip()[:255]
+                else:
+                    host = None
+                if isinstance(method, str):
+                    method = method.strip().upper()[:16]
+                else:
+                    method = None
+                if isinstance(msg, str):
+                    msg = msg.strip()[:255]
+                else:
+                    msg = None
+
+                return (target, host, method, msg)
+
+    # fallback host ggf. aus source?
+    host = None
+    if isinstance(a.get("source"), dict):
+        host = a["source"].get("target_fqdn")
+
+    # finalize fallback
+    if isinstance(target, str):
+        target = target.strip()[:512]
+    else:
+        target = None
+    if isinstance(host, str):
+        host = host.strip()[:255]
+    else:
+        host = None
+    if isinstance(method, str):
+        method = method.strip().upper()[:16]
+    else:
+        method = None
+    if isinstance(msg, str):
+        msg = msg.strip()[:255]
+    else:
+        msg = None
+
+    return (target, host, method, msg)
+
 # ============================================================
 # CrowdSec Auth (Watcher JWT cache)
 # ============================================================
@@ -375,6 +465,51 @@ def meta_dict(x):
                 return it
     return {}
 
+def kv_meta_to_dict(x) -> dict:
+    """
+    CrowdSec liefert meta oft als list[{"key": "...", "value": "..."}]
+    Wir normalisieren auf {key: value}.
+    Wenn mehrere gleiche keys: wir nehmen das letzte.
+    """
+    if isinstance(x, dict):
+        return x
+    out = {}
+    if isinstance(x, list):
+        for it in x:
+            if not isinstance(it, dict):
+                continue
+            k = it.get("key")
+            if not k:
+                continue
+            v = it.get("value")
+            out[str(k)] = v
+    return out
+
+def _maybe_json_first(v):
+    """
+    Viele meta values sind Strings wie: '["/.env"]'
+    Wir versuchen JSON zu parsen und geben (falls list) das erste Element zurück.
+    """
+    if v is None:
+        return None
+    if isinstance(v, (list, dict)):
+        # already parsed
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        # JSON array string?
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                j = json.loads(s)
+                if isinstance(j, list):
+                    return j[0] if j else None
+                return j
+            except Exception:
+                return v
+    return v
+
 def _as_list(x):
     if isinstance(x, list):
         return x
@@ -414,8 +549,6 @@ async def crowdsec_poll_once(db: DB):
     alerts = await fetch_with_auth(f"/v1/alerts?limit={CROWDSEC_FETCH_LIMIT}")
     decisions = await fetch_with_auth(f"/v1/decisions?limit={CROWDSEC_FETCH_LIMIT}")
 
-    alerts_list = _as_list(alerts)
-    decisions_list = _as_list(decisions)
     alerts_list = [a for a in _as_list(alerts) if isinstance(a, dict)]
     decisions_list = [d for d in _as_list(decisions) if isinstance(d, dict)]
 
@@ -423,7 +556,7 @@ async def crowdsec_poll_once(db: DB):
     for a in alerts_list:
         try:
             # ---- ID robust ----            
-            raw_id = a.get("id") or a.get("uuid") or (as_dict(a.get("meta")) or {}).get("uuid")
+            raw_id = a.get("id") or a.get("uuid") or (kv_meta_to_dict(a.get("meta")) or {}).get("uuid")
             if isinstance(raw_id, int):
                 alert_id = raw_id
             elif isinstance(raw_id, str) and raw_id.strip():
@@ -451,6 +584,7 @@ async def crowdsec_poll_once(db: DB):
                     ipb = None
 
             scenario = a.get("scenario") or a.get("scenario_name") or a.get("scenario_name_slug")
+            alert_message = a.get("message") or None 
             # 🔥 Filter: CAPI / Blocklist Updates ignorieren
             if scenario:
                 s = scenario.lower()
@@ -458,7 +592,8 @@ async def crowdsec_poll_once(db: DB):
                     continue
             reason = a.get("message") or a.get("reason") or scenario
 
-            meta = meta_dict(a.get("meta"))
+            meta = kv_meta_to_dict(a.get("meta"))
+            target, http_host, http_method, msg = pick_alert_target(a)
 
             country = (a.get("country") or meta.get("country") or "").upper()[:2] or None
             # Fallback: GeoIP anhand IP, wenn CrowdSec kein Country liefert
@@ -477,24 +612,32 @@ async def crowdsec_poll_once(db: DB):
                 dc = 0
 
             raw = json.dumps(a, ensure_ascii=False)
+            
 
             await db.exec(
                 """
                 INSERT INTO crowdsec_alerts
-                  (id, ts_utc, ip, scope, value, reason, scenario, country, as_name, decisions_count, raw_json)
+                (id, ts_utc, ip, scope, value, reason, scenario, country, as_name, decisions_count,
+                target, http_host, http_method, msg, alert_message, raw_json)
                 VALUES
-                  (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                  ts_utc=VALUES(ts_utc),
-                  ip=VALUES(ip),
-                  scope=VALUES(scope),
-                  value=VALUES(value),
-                  reason=VALUES(reason),
-                  scenario=VALUES(scenario),
-                  country=VALUES(country),
-                  as_name=VALUES(as_name),
-                  decisions_count=VALUES(decisions_count),
-                  raw_json=VALUES(raw_json)
+                ts_utc=VALUES(ts_utc),
+                ip=VALUES(ip),
+                scope=VALUES(scope),
+                value=VALUES(value),
+                reason=VALUES(reason),
+                scenario=VALUES(scenario),
+                country=VALUES(country),
+                as_name=VALUES(as_name),
+                decisions_count=VALUES(decisions_count),
+                target=VALUES(target),
+                http_host=VALUES(http_host),
+                http_method=VALUES(http_method),
+                msg=VALUES(msg),
+                alert_message=VALUES(alert_message),
+                raw_json=VALUES(raw_json)
                 """,
                 (
                     alert_id,
@@ -507,7 +650,12 @@ async def crowdsec_poll_once(db: DB):
                     country,
                     as_name[:255] if isinstance(as_name, str) else None,
                     dc,
-                    raw,
+                    target,
+                    http_host,
+                    http_method,
+                    msg,  # <-- WICHTIG: msg kommt hier rein
+                    alert_message[:255] if isinstance(alert_message, str) else None,
+                    raw,  # <-- und raw_json ganz am Ende
                 ),
             )
         except Exception:
@@ -679,6 +827,7 @@ class StateStore:
         self.path = path
         self.lock = asyncio.Lock()
         self.state: Dict[str, FileState] = {}
+        self._dirty = False
 
     def _load_sync(self) -> None:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -714,16 +863,25 @@ class StateStore:
         async with self.lock:
             await asyncio.to_thread(self._save_sync)
 
+    async def save_if_dirty(self):
+        async with self.lock:
+            if not self._dirty:
+                return
+            self._dirty = False
+        await asyncio.to_thread(self._save_sync)
+
     async def get(self, key: str) -> FileState:
         async with self.lock:
             if key not in self.state:
                 self.state[key] = FileState()
             return self.state[key]
 
-    async def update(self, key: str, inode: int, offset: int, initialized: bool) -> None:
+    async def update(self, key: str, inode: int, offset: int, initialized: bool, save: bool = False) -> None:
         async with self.lock:
             self.state[key] = FileState(inode=inode, offset=offset, initialized=initialized)
-        await self.save()
+            self._dirty = True
+        if save:
+            await self.save_if_dirty()
 
 
 # ============================================================
@@ -871,6 +1029,33 @@ class DB:
             await asyncio.to_thread(self._run_sync, "ALTER TABLE geo_blocks ADD KEY idx_url_ts (url(191), ts_utc)", None, "none")
         except Exception:
             pass
+
+        # --- crowdsec_alerts: targets support ---
+        try:
+            await asyncio.to_thread(self._run_sync, "ALTER TABLE crowdsec_alerts ADD COLUMN target VARCHAR(512) NULL", None, "none")
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(self._run_sync, "ALTER TABLE crowdsec_alerts ADD COLUMN http_host VARCHAR(255) NULL", None, "none")
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(self._run_sync, "ALTER TABLE crowdsec_alerts ADD COLUMN http_method VARCHAR(16) NULL", None, "none")
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(self._run_sync, "ALTER TABLE crowdsec_alerts ADD KEY idx_target_ts (target, ts_utc)", None, "none")
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(self._run_sync, "ALTER TABLE crowdsec_alerts ADD COLUMN msg VARCHAR(255) NULL", None, "none")
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(self._run_sync, "ALTER TABLE crowdsec_alerts ADD COLUMN alert_message VARCHAR(255) NULL", None, "none")
+        except Exception:
+            pass
+
 
     async def exec(self, sql: str, args=None):
         await self.connect()
@@ -1095,7 +1280,7 @@ async def tail_file_forever(path: str, state_store: StateStore, broadcaster: Bro
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="Geo Log Hub", version="1.4.0")
+
 
 state_store = StateStore(STATE_FILE)
 db = DB()
@@ -1120,8 +1305,18 @@ async def on_startup():
                 pass
             await asyncio.sleep(RETENTION_RUN_EVERY_SEC)
 
+    async def state_flush_loop():
+        while True:
+            try:
+                await state_store.save_if_dirty()
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
+
+    asyncio.create_task(state_flush_loop())
     asyncio.create_task(retention_loop())
     asyncio.create_task(crowdsec_loop())
+    
 
 
 async def crowdsec_loop():
@@ -1708,6 +1903,27 @@ async def crowdsec_stats(hours: int = 24):
         "decisions_active_unique_ips": int(uniq_dec_ips["c"]) if uniq_dec_ips else 0,
     }
 
+@app.get("/crowdsec/chart/targets")
+async def crowdsec_chart_targets(hours: int = 24, limit: int = 10):
+    hours = clamp_hours(hours)
+    limit = clamp_limit(limit, 3, 50)
+
+    rows = await db.fetchall(
+        f"""
+        SELECT COALESCE(NULLIF(target,''),'(unknown)') AS target, COUNT(*) AS c
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR)
+        GROUP BY COALESCE(NULLIF(target,''),'(unknown)')
+        ORDER BY c DESC
+        LIMIT {limit}
+        """,
+        (hours,),
+    )
+    return {
+        "window_hours": hours,
+        "labels": [r["target"] for r in (rows or [])],
+        "values": [int(r["c"]) for r in (rows or [])],
+    }
 
 @app.get("/crowdsec/chart/scenarios")
 async def crowdsec_chart_scenarios(hours: int = 24, limit: int = 10):
@@ -1855,15 +2071,41 @@ async def crowdsec_top_ips(hours: int = 24, limit: int = 15):
 
     return {"window_hours": hours, "items": items}
 
+@app.get("/crowdsec/top/targets")
+async def crowdsec_top_targets(hours: int = 24, limit: int = 10):
+    hours = clamp_hours(hours)
+    limit = clamp_limit(limit, 1, 50)
+
+    rows = await db.fetchall(
+        f"""
+        SELECT
+          COALESCE(NULLIF(target,''),'(unknown)') AS target,
+          COUNT(*) AS c,
+          SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT COALESCE(NULLIF(msg,''), '') SEPARATOR ' | '), ' | ', 1) AS msg
+        FROM crowdsec_alerts
+        WHERE ts_utc >= (UTC_TIMESTAMP() - INTERVAL %s HOUR)
+        GROUP BY COALESCE(NULLIF(target,''),'(unknown)')
+        ORDER BY c DESC
+        LIMIT {limit}
+        """,
+        (hours,),
+    )
+    return {"window_hours": hours, "items": [{"target": r["target"], "count": int(r["c"]), "msg": (r.get("msg") or "")} for r in (rows or [])]}
+
 @app.get("/crowdsec/alerts/latest")
-async def crowdsec_alerts_latest(limit: int = 50):
+async def crowdsec_alerts_latest(limit: int = 30):
     limit = clamp_limit(limit, 1, 200)
 
     rows = await db.fetchall(
         f"""
         SELECT ts_utc, scenario, value, decisions_count,
-               COALESCE(NULLIF(country,''),'??') AS country,
-               COALESCE(as_name,'') AS as_name
+            COALESCE(NULLIF(country,''),'??') AS country,
+            COALESCE(as_name,'') AS as_name,
+            COALESCE(target,'') AS target,
+            COALESCE(http_host,'') AS http_host,
+            COALESCE(http_method,'') AS http_method,
+            COALESCE(msg,'') AS msg,
+            COALESCE(alert_message,'') AS alert_message
         FROM crowdsec_alerts
         ORDER BY ts_utc DESC
         LIMIT {limit}
@@ -1881,6 +2123,11 @@ async def crowdsec_alerts_latest(limit: int = 50):
             "value": r.get("value") or "",
             "decisions_count": int(r.get("decisions_count") or 0),
             "as_name": r.get("as_name") or "",
+            "target": r.get("target") or "",
+            "http_host": r.get("http_host") or "",
+            "http_method": r.get("http_method") or "",
+            "msg": r.get("msg") or "",
+            "alert_message": r.get("alert_message") or "",
             **meta,
         })
 
@@ -1898,12 +2145,6 @@ async def ui():
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Geo Log Hub</title>
 <style>
-@font-face{
-  font-family: 'NotoColorEmojiWeb';
-  src: url('/static/fonts/NotoColorEmoji.ttf') format('truetype');
-  font-weight: normal;
-  font-style: normal;
-}
 body,
 .mono,
 table,
@@ -1912,7 +2153,6 @@ td,
 select,
 option {
   font-family:
-    'NotoColorEmojiWeb',
     'Segoe UI Emoji',
     'Apple Color Emoji',
     'Noto Color Emoji',
@@ -1996,6 +2236,23 @@ option {
   background:#ef4444; /* rot */
   height:100%;
 }
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.half {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+/* Optional: Tabellen in der Card scrollen lassen */
+.scrollbox {
+  max-height: 320px;   /* nach Geschmack */
+  overflow: auto;
+}
 </style>
 </head>
 <body>
@@ -2069,9 +2326,10 @@ option {
   <div class="row" style="justify-content:space-between">
     <b>CROWDSEC</b>
     <select id="csMode" onchange="loadCrowdsec()">
-      <option value="scenarios" selected>Scenarios</option>
-      <option value="countries">Länder</option>
+      <option value="scenarios">Scenarios</option>
+      <option value="countries" selected>Länder</option>
       <option value="ips">IPs</option>
+      <option value="targets">Targets</option>
     </select>
   </div>
 
@@ -2197,18 +2455,33 @@ option {
   </table>
 </div>
 
-<!-- CROWDSEC Top Scenarios -->
-<div class="card span6">
-  <div class="row" style="justify-content:space-between">
-    <b>CROWDSEC Top Scenarios</b>
-    <button onclick="loadCsTopScenarios()">Reload</button>
-  </div>
-  <table class="table tight" style="margin-top:8px">
-    <thead><tr><th>Scenario</th><th class="right">Count</th></tr></thead>
-    <tbody id="csTopScenarios"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
-  </table>
-</div>
+<div class="span6 col">
 
+    <!-- CROWDSEC Top Scenarios -->
+    <div class="card">
+    <div class="row" style="justify-content:space-between">
+        <b>CROWDSEC Top Scenarios</b>
+        <button onclick="loadCsTopScenarios()">Reload</button>
+    </div>
+    <table class="table tight" style="margin-top:8px">
+        <thead><tr><th>Scenario</th><th class="right">Count</th></tr></thead>
+        <tbody id="csTopScenarios"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
+    </table>
+    </div>
+
+    <!-- CROWDSEC Top Targets -->
+    <div class="card half">
+    <div class="row" style="justify-content:space-between">
+        <b>CROWDSEC Top Targets</b>
+        <button onclick="loadCsTopTargets()">Reload</button>
+    </div>
+    <table class="table tight" style="margin-top:8px">
+        <thead><tr><th>Target</th><th class="right">Count</th></tr></thead>
+        <tbody id="csTopTargets"><tr><td class="muted" colspan="2">loading…</td></tr></tbody>
+    </table>
+    </div>
+
+</div>
 
 
   <!-- GEO Top URLs -->
@@ -2449,11 +2722,22 @@ async function loadCsLatestAlerts(){
     const cc = (it.country || '??').toUpperCase();
     const lab = countryLabel(cc);
     const name = it.country_name || (lab.title || 'Unbekannt');
+    const t = it.target || '';
+    const host = it.http_host || '';
+    const meth = it.http_method || '';
+
+    const tipParts = [
+    [meth, host, t].filter(Boolean).join(' '),
+    it.msg || '',
+    it.alert_message || ''
+    ].filter(Boolean);
+
+    const tip = tipParts.join('\\n');
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="mono">${escapeHtml(it.ts_utc || '')}</td>
-      <td class="mono" title="${escapeHtml(it.as_name || '')}">${escapeHtml(it.scenario || '')}</td>
+      <td class="mono" title="${escapeHtml(tip)}">${escapeHtml(it.scenario || '')}</td>
       <td class="mono"><span title="${escapeHtml(name)}">${escapeHtml(lab.text || cc)}</span> ${escapeHtml(it.value || '')}</td>
       <td class="right">${it.decisions_count ?? 0}</td>
     `;
@@ -2696,6 +2980,7 @@ async function loadCrowdsec(){
   let chartUrl = `/crowdsec/chart/scenarios?hours=${h}&limit=10`;
   if(mode === 'countries') chartUrl = `/crowdsec/chart/countries?hours=${h}&limit=10`;
   if(mode === 'ips')       chartUrl = `/crowdsec/chart/ips?hours=${h}&limit=10`;
+  if(mode === 'targets')   chartUrl = `/crowdsec/chart/targets?hours=${h}&limit=10`;
 
   const c = await fetch(chartUrl);
   const cj = await c.json();
@@ -2745,7 +3030,7 @@ tr.innerHTML = `
 
 async function loadCsTopScenarios(){
   const h = getHours();
-  const r = await fetch(`/crowdsec/top/scenarios?hours=${h}&limit=15`);
+  const r = await fetch(`/crowdsec/top/scenarios?hours=${h}&limit=10`);
   const j = await r.json();
   const tb = document.getElementById('csTopScenarios');
   const items = j.items || [];
@@ -2867,7 +3152,25 @@ async function loadGeoCountriesDropdown(){
   const exists = Array.from(sel.options).some(o => o.value === current);
   sel.value = exists ? current : items[0].country;
 }
+async function loadCsTopTargets(){
+  const h = getHours();
+  const r = await fetch(`/crowdsec/top/targets?hours=${h}&limit=10`);
+  const j = await r.json();
+  const tb = document.getElementById('csTopTargets');
+  const items = j.items || [];
+  tb.innerHTML = items.length ? '' : '<tr><td class="muted" colspan="2">keine Daten</td></tr>';
 
+  items.forEach(it=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+        <td class="mono" title="${escapeHtml(it.msg || '')}">
+            ${escapeHtml(it.target || '(unknown)')}
+        </td>
+        <td class="right">${it.count || 0}</td>
+        `;
+    tb.appendChild(tr);
+  });
+}
 async function loadGeoTopUrlsByCountry(){
   const h = getHours();
   const country = (document.getElementById('geoCountry').value || 'US');
@@ -2899,6 +3202,7 @@ async function reloadAll(){
     loadCsTopCountries(),
     loadCsTopIps(),
     loadCsLatestAlerts(),
+    loadCsTopTargets(),
     loadGeoCountriesDropdown(),
   ]);
   await loadGeoTopUrlsByCountry();
