@@ -1263,18 +1263,37 @@ async def tail_file_forever(path: str, state_store: StateStore, broadcaster: Bro
                                 pass
 
                     else:
+                        # Keine neue Zeile -> kurz schlafen und prüfen, ob
+                        #  - Datei rotiert wurde (inode geändert)
+                        #  - Datei via copytruncate kleiner geworden ist (size < offset)
                         await asyncio.sleep(POLL_INTERVAL)
                         try:
                             st2 = os.stat(path)
+
+                            # 1) Rotation: inode geändert -> raus, außen neu öffnen
                             if st2.st_ino != inode:
+                                break
+
+                            # 2) copytruncate: Datei kleiner als unser letzter Offset
+                            #    -> raus, damit der äußere Loop offset auf 0 setzt
+                            if st2.st_size < fs.offset:
+                                # Optional fürs Debuggen:
+                                print(
+                                    f"[tail] detected truncate on {path}: "
+                                    f"size={st2.st_size}, offset={fs.offset}",
+                                    flush=True,
+                                )
                                 break
                         except FileNotFoundError:
                             break
 
+
         except FileNotFoundError:
             await asyncio.sleep(2.0)
         except Exception:
+            print(f"[tail] error in {path}:\n" + traceback.format_exc(), flush=True)
             await asyncio.sleep(1.0)
+
 
 
 # ============================================================
