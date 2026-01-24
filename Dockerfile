@@ -15,7 +15,8 @@ COPY app /app/app
 
 
 
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    STATIC_DIR=/app/app/static
 EXPOSE 8088
 
 ENTRYPOINT ["/usr/bin/tini","--"]

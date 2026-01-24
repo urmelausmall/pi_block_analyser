@@ -2164,6 +2164,13 @@ async def ui():
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Geo Log Hub</title>
 <style>
+@font-face {
+  font-family: "Futur";
+  src: url("/static/fonts/futur-regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
 body,
 .mono,
 table,
@@ -2172,17 +2179,16 @@ td,
 select,
 option {
   font-family:
-    'Segoe UI Emoji',
-    'Apple Color Emoji',
-    'Noto Color Emoji',
+    "Futur",
     system-ui,
+    "Segoe UI",
     sans-serif;
 }
   :root{
     --bg:#0b0f14; --card:#0f172a; --card2:#111827; --line:#233047;
     --txt:#d6deeb; --muted:#93a4bd; --acc:#93c5fd;
   }
-  body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,Segoe UI,Segoe UI Emoji,Noto Color Emoji,Roboto,Arial,sans-serif}
+  body{margin:0;background:var(--bg);color:var(--txt);font-family:Futur,system-ui,Roboto,Arial,sans-serif}
   header{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px 16px;background:var(--card2);border-bottom:1px solid var(--line)}
   header b{letter-spacing:.2px}
   main{padding:12px 16px}
@@ -2271,6 +2277,12 @@ option {
 .scrollbox {
   max-height: 320px;   /* nach Geschmack */
   overflow: auto;
+}
+.cell-target {
+  max-width: 260px;      /* Breite der Target-Spalte, nach Geschmack */
+  white-space: nowrap;   /* nicht umbrechen */
+  overflow: hidden;      /* überflüssiges abschneiden */
+  text-overflow: ellipsis; /* "…" am Ende */
 }
 </style>
 </head>
@@ -2568,6 +2580,8 @@ let sumPie = null;
 let csPie=null;
 
 let COUNTRY = {}; // ISO2 -> {country,country_name,flag}
+
+const MAX_TARGET_LEN = 80;
 
 const htmlLegendPlugin = {
   id: 'htmlLegend',
@@ -3173,7 +3187,7 @@ async function loadGeoCountriesDropdown(){
 }
 async function loadCsTopTargets(){
   const h = getHours();
-  const r = await fetch(`/crowdsec/top/targets?hours=${h}&limit=10`);
+  const r = await fetch(`/crowdsec/top/targets?hours=${h}&limit=30`);
   const j = await r.json();
   const tb = document.getElementById('csTopTargets');
   const items = j.items || [];
@@ -3181,15 +3195,34 @@ async function loadCsTopTargets(){
 
   items.forEach(it=>{
     const tr = document.createElement('tr');
+
+    const fullTarget = it.target || '(unknown)';
+    let displayTarget = fullTarget;
+
+    // hart begrenzen, damit lange /cgi-bin/... nicht alles sprengen
+    if (displayTarget.length > MAX_TARGET_LEN) {
+      displayTarget = displayTarget.slice(0, MAX_TARGET_LEN - 1) + '…';
+    }
+
+    const tipParts = [
+      fullTarget,
+      it.msg || ''
+    ].filter(Boolean);
+
+
+    const tip = tipParts.join('\\n');
+
     tr.innerHTML = `
-        <td class="mono" title="${escapeHtml(it.msg || '')}">
-            ${escapeHtml(it.target || '(unknown)')}
-        </td>
-        <td class="right">${it.count || 0}</td>
-        `;
+      <td class="mono cell-target" title="${escapeHtml(tip)}">
+        ${escapeHtml(displayTarget)}
+      </td>
+      <td class="right">${it.count || 0}</td>
+    `;
     tb.appendChild(tr);
   });
 }
+
+
 async function loadGeoTopUrlsByCountry(){
   const h = getHours();
   const country = (document.getElementById('geoCountry').value || 'US');
