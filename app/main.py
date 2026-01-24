@@ -2166,8 +2166,8 @@ async def ui():
 <style>
 @font-face {
   font-family: "Futur";
-  src: url("/static/fonts/futur-regular.ttf") format("truetype");
-  font-weight: 400;
+  src: url("/static/fonts/futur-bold.ttf") format("truetype");
+  font-weight: normal;
   font-style: normal;
   font-display: swap;
 }
